@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, Integer, String, Boolean, select
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
 import pandas as pd
 import os
 
@@ -10,21 +11,19 @@ from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
 import logging
 import uuid
 from pythonjsonlogger import jsonlogger
-from fastapi import Request
 
 app = FastAPI(title="Driver Service")
 
-DATABASE_URL = "sqlite:///./driver_service.db"
+DATABASE_URL = "sqlite+aiosqlite:///./driver_service.db"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
+engine = create_async_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 avg_driver_rating = Gauge(
     "avg_driver_rating",
     "Average driver rating"
 )
-
 avg_driver_rating.set(4.3)
 
 logger = logging.getLogger("driver-service")
@@ -42,8 +41,6 @@ if not logger.handlers:
 
 def get_correlation_id(request: Request):
     return request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
-
-
 
 
 class Driver(Base):
@@ -71,40 +68,42 @@ class DriverStatusRequest(BaseModel):
     is_active: bool
 
 
-Base.metadata.create_all(bind=engine)
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
 
 
 def to_bool(value):
     return str(value).lower() in ["true", "1", "yes", "active"]
 
 
-def seed_data():
-    db = SessionLocal()
-
-    if db.query(Driver).count() == 0:
-        csv_path = os.getenv("DRIVERS_CSV_PATH", "../data/ride_drivers.csv")
-
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-
-            for _, row in df.iterrows():
-                driver = Driver(
-                    id=int(row.get("driver_id", row.get("id", 0))),
-                    name=str(row.get("name", "")),
-                    phone=str(row.get("phone", "")),
-                    vehicle_type=str(row.get("vehicle_type", "Car")),
-                    license_plate=str(row.get("license_plate", row.get("vehicle_plate", ""))),
-                    city=str(row.get("city", "Jaipur")),
-                    is_active=to_bool(row.get("is_active", True))
-                )
-                db.add(driver)
-
-            db.commit()
-
-    db.close()
-
-
-seed_data()
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    
+    async with SessionLocal() as db:
+        result = await db.execute(select(Driver))
+        if len(result.scalars().all()) == 0:
+            csv_path = os.getenv("DRIVERS_CSV_PATH", "../data/ride_drivers.csv")
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                for _, row in df.iterrows():
+                    driver = Driver(
+                        id=int(row.get("driver_id", row.get("id", 0))),
+                        name=str(row.get("name", "")),
+                        phone=str(row.get("phone", "")),
+                        vehicle_type=str(row.get("vehicle_type", "Car")),
+                        license_plate=str(row.get("license_plate", row.get("vehicle_plate", ""))),
+                        city=str(row.get("city", "Jaipur")),
+                        is_active=to_bool(row.get("is_active", True))
+                    )
+                    db.add(driver)
+                await db.commit()
 
 
 @app.get("/metrics")
@@ -118,15 +117,13 @@ def health():
 
 
 @app.get("/v1/drivers")
-def get_drivers():
-    db = SessionLocal()
-    drivers = db.query(Driver).all()
-    db.close()
-    return drivers
+async def get_drivers(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Driver))
+    return result.scalars().all()
 
 
 @app.get("/v1/drivers/available")
-def get_available_driver(request: Request, city: str = "Jaipur"):
+async def get_available_driver(request: Request, city: str = "Jaipur", db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
     logger.info(
@@ -134,14 +131,10 @@ def get_available_driver(request: Request, city: str = "Jaipur"):
         extra={"correlation_id": correlation_id}
     )
 
-    db = SessionLocal()
-
-    driver = db.query(Driver).filter(
-        Driver.city == city,
-        Driver.is_active == True
-    ).first()
-
-    db.close()
+    result = await db.execute(
+        select(Driver).filter(Driver.city == city, Driver.is_active == True)
+    )
+    driver = result.scalars().first()
 
     if not driver:
         logger.error(
@@ -159,10 +152,9 @@ def get_available_driver(request: Request, city: str = "Jaipur"):
 
 
 @app.get("/v1/drivers/{driver_id}")
-def get_driver(driver_id: int):
-    db = SessionLocal()
-    driver = db.query(Driver).filter(Driver.id == driver_id).first()
-    db.close()
+async def get_driver(driver_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Driver).filter(Driver.id == driver_id))
+    driver = result.scalars().first()
 
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
@@ -171,9 +163,7 @@ def get_driver(driver_id: int):
 
 
 @app.post("/v1/drivers")
-def create_driver(request: DriverRequest):
-    db = SessionLocal()
-
+async def create_driver(request: DriverRequest, db: AsyncSession = Depends(get_db)):
     driver = Driver(
         name=request.name,
         phone=request.phone,
@@ -184,20 +174,18 @@ def create_driver(request: DriverRequest):
     )
 
     db.add(driver)
-    db.commit()
-    db.refresh(driver)
-    db.close()
+    await db.commit()
+    await db.refresh(driver)
 
     return driver
 
 
 @app.put("/v1/drivers/{driver_id}")
-def update_driver(driver_id: int, request: DriverRequest):
-    db = SessionLocal()
-    driver = db.query(Driver).filter(Driver.id == driver_id).first()
+async def update_driver(driver_id: int, request: DriverRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Driver).filter(Driver.id == driver_id))
+    driver = result.scalars().first()
 
     if not driver:
-        db.close()
         raise HTTPException(status_code=404, detail="Driver not found")
 
     driver.name = request.name
@@ -207,26 +195,23 @@ def update_driver(driver_id: int, request: DriverRequest):
     driver.city = request.city
     driver.is_active = request.is_active
 
-    db.commit()
-    db.refresh(driver)
-    db.close()
+    await db.commit()
+    await db.refresh(driver)
 
     return driver
 
 
 @app.patch("/v1/drivers/{driver_id}/status")
-def update_driver_status(driver_id: int, request: DriverStatusRequest):
-    db = SessionLocal()
-    driver = db.query(Driver).filter(Driver.id == driver_id).first()
+async def update_driver_status(driver_id: int, request: DriverStatusRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Driver).filter(Driver.id == driver_id))
+    driver = result.scalars().first()
 
     if not driver:
-        db.close()
         raise HTTPException(status_code=404, detail="Driver not found")
 
     driver.is_active = request.is_active
 
-    db.commit()
-    db.refresh(driver)
-    db.close()
+    await db.commit()
+    await db.refresh(driver)
 
     return driver
