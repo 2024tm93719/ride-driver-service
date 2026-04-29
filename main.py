@@ -5,6 +5,13 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 import pandas as pd
 import os
 
+from fastapi.responses import Response
+from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+import logging
+import uuid
+from pythonjsonlogger import jsonlogger
+from fastapi import Request
+
 app = FastAPI(title="Driver Service")
 
 DATABASE_URL = "sqlite:///./driver_service.db"
@@ -12,6 +19,31 @@ DATABASE_URL = "sqlite:///./driver_service.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+avg_driver_rating = Gauge(
+    "avg_driver_rating",
+    "Average driver rating"
+)
+
+avg_driver_rating.set(4.3)
+
+logger = logging.getLogger("driver-service")
+logger.setLevel(logging.INFO)
+
+log_handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    "%(asctime)s %(levelname)s %(name)s %(message)s %(correlation_id)s"
+)
+log_handler.setFormatter(formatter)
+
+if not logger.handlers:
+    logger.addHandler(log_handler)
+
+
+def get_correlation_id(request: Request):
+    return request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+
+
 
 
 class Driver(Base):
@@ -75,6 +107,11 @@ def seed_data():
 seed_data()
 
 
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/health")
 def health():
     return {"service": "driver-service", "status": "UP"}
@@ -89,7 +126,14 @@ def get_drivers():
 
 
 @app.get("/v1/drivers/available")
-def get_available_driver(city: str = "Jaipur"):
+def get_available_driver(request: Request, city: str = "Jaipur"):
+    correlation_id = get_correlation_id(request)
+
+    logger.info(
+        f"Searching available driver in city {city}",
+        extra={"correlation_id": correlation_id}
+    )
+
     db = SessionLocal()
 
     driver = db.query(Driver).filter(
@@ -100,7 +144,16 @@ def get_available_driver(city: str = "Jaipur"):
     db.close()
 
     if not driver:
+        logger.error(
+            "No active driver available",
+            extra={"correlation_id": correlation_id}
+        )
         raise HTTPException(status_code=404, detail="No active driver available")
+
+    logger.info(
+        f"Available driver found: {driver.id}",
+        extra={"correlation_id": correlation_id}
+    )
 
     return driver
 
