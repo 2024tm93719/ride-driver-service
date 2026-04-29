@@ -50,7 +50,7 @@ def seed_data():
     db = SessionLocal()
 
     if db.query(Driver).count() == 0:
-        csv_path = "../data/ride_drivers.csv"
+        csv_path = os.getenv("DRIVERS_CSV_PATH", "../data/ride_drivers.csv")
 
         if os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
