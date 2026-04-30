@@ -64,6 +64,19 @@ class DriverRequest(BaseModel):
     is_active: bool = True
 
 
+class DriverResponse(BaseModel):
+    id: int
+    name: str
+    phone: str
+    vehicle_type: str
+    license_plate: str
+    city: str
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
 class DriverStatusRequest(BaseModel):
     is_active: bool
 
@@ -76,6 +89,17 @@ async def init_db():
 async def get_db():
     async with SessionLocal() as session:
         yield session
+
+
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    import uuid
+    correlation_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+    # Set correlation id in request state for logger access
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
 
 
 def to_bool(value):
@@ -116,15 +140,15 @@ def health():
     return {"service": "driver-service", "status": "UP"}
 
 
-@app.get("/v1/drivers")
+@app.get("/v1/drivers", response_model=list[DriverResponse])
 async def get_drivers(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Driver))
     return result.scalars().all()
 
 
-@app.get("/v1/drivers/available")
+@app.get("/v1/drivers/available", response_model=DriverResponse)
 async def get_available_driver(request: Request, city: str = "Jaipur", db: AsyncSession = Depends(get_db)):
-    correlation_id = get_correlation_id(request)
+    correlation_id = request.state.correlation_id
 
     logger.info(
         f"Searching available driver in city {city}",
@@ -151,7 +175,7 @@ async def get_available_driver(request: Request, city: str = "Jaipur", db: Async
     return driver
 
 
-@app.get("/v1/drivers/{driver_id}")
+@app.get("/v1/drivers/{driver_id}", response_model=DriverResponse)
 async def get_driver(driver_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Driver).filter(Driver.id == driver_id))
     driver = result.scalars().first()
@@ -162,7 +186,7 @@ async def get_driver(driver_id: int, db: AsyncSession = Depends(get_db)):
     return driver
 
 
-@app.post("/v1/drivers")
+@app.post("/v1/drivers", response_model=DriverResponse)
 async def create_driver(request: DriverRequest, db: AsyncSession = Depends(get_db)):
     driver = Driver(
         name=request.name,
@@ -180,7 +204,7 @@ async def create_driver(request: DriverRequest, db: AsyncSession = Depends(get_d
     return driver
 
 
-@app.put("/v1/drivers/{driver_id}")
+@app.put("/v1/drivers/{driver_id}", response_model=DriverResponse)
 async def update_driver(driver_id: int, request: DriverRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Driver).filter(Driver.id == driver_id))
     driver = result.scalars().first()
@@ -201,7 +225,7 @@ async def update_driver(driver_id: int, request: DriverRequest, db: AsyncSession
     return driver
 
 
-@app.patch("/v1/drivers/{driver_id}/status")
+@app.patch("/v1/drivers/{driver_id}/status", response_model=DriverResponse)
 async def update_driver_status(driver_id: int, request: DriverStatusRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Driver).filter(Driver.id == driver_id))
     driver = result.scalars().first()
